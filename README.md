@@ -1,2 +1,2 @@
 # ClipCap
-incorporating CLIP features into Transformer-based image captioning
+Incorporating CLIP features into Transformer-based image captioning
