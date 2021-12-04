@@ -2,7 +2,8 @@ from transformers import GPT2LMHeadModel
 from enum import Enum 
 import torch.nn as nn 
 from torch.nn import functional as F
-import torch 
+import torch
+from transformers.models import gpt2 
 
 class MappingType(Enum):
     MLP = 'mlp'
@@ -24,7 +25,7 @@ class MLP(nn.Module):
 
 
 class MlpTransformer(nn.Module):
-    def __init__(self, in_dim, h_dim, out_d, act=F.relu, dropout=0.):
+    def __init__(self, in_dim, h_dim, out_d=None, act=F.relu, dropout=0.):
         super().__init__()
         out_d = out_d if out_d is not None else in_dim
         self.fc1 = nn.Linear(in_dim, h_dim)
@@ -86,7 +87,7 @@ class TransformerLayer(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
-    def __init__(self, dim_self, dim_ref, num_heads, mlp_ratio=4., bias=False, dropout=0., act=nnf.relu,
+    def __init__(self, dim_self, dim_ref, num_heads, mlp_ratio=4., bias=False, dropout=0., act=F.relu,
                  norm_layer: nn.Module = nn.LayerNorm):
         super().__init__()
         self.norm1 = norm_layer(dim_self)
@@ -114,8 +115,8 @@ class Transformer(nn.Module):
                 x = layer(x, y, mask)
         return x
 
-    def __init__(self, dim_self: int, num_heads: int, num_layers: int, dim_ref=None,
-                 mlp_ratio: float = 2., act=F.relu, norm_layer: nn.Module = nn.LayerNorm, enc_dec: bool = False):
+    def __init__(self, dim_self, num_heads, num_layers, dim_ref=None,
+                 mlp_ratio=2., act=F.relu, norm_layer=nn.LayerNorm, enc_dec=False):
         super(Transformer, self).__init__()
         dim_ref = dim_ref if dim_ref is not None else dim_self
         self.enc_dec = enc_dec
@@ -136,46 +137,57 @@ class Transformer(nn.Module):
 class TransformerMapper(nn.Module):
 
     def forward(self, x):
-        x = self.linear(x).view(x.shape[0], self.clip_length, -1)
+        x = self.linear(x).view(x.shape[0], self.img_length, -1)
         prefix = self.prefix_const.unsqueeze(0).expand(x.shape[0], *self.prefix_const.shape)
         prefix = torch.cat((x, prefix), dim=1)
-        out = self.transformer(prefix)[:, self.clip_length:]
+        out = self.transformer(prefix)[:, self.img_length:]
         return out
 
-    def __init__(self, dim_clip: int, dim_embedding: int, prefix_length: int, clip_length: int, num_layers: int = 8):
+    # dim_cilp = 512, dim_embedding = 768, 
+    def __init__(self, dim_clip, dim_embedding, img_length, clip_constant, num_layers):
         super(TransformerMapper, self).__init__()
-        self.clip_length = clip_length
+        self.img_length = img_length
         self.transformer = Transformer(dim_embedding, 8, num_layers)
-        self.linear = nn.Linear(dim_clip, clip_length * dim_embedding)
-        self.prefix_const = nn.Parameter(torch.randn(prefix_length, dim_embedding), requires_grad=True)
+        self.linear = nn.Linear(dim_clip, clip_constant * dim_embedding)
+        self.prefix_const = nn.Parameter(torch.randn(img_length, dim_embedding), requires_grad=True)
 
 
 class ClipCaptionModel(nn.Module):
 
-    def get_dummy_token(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        return torch.zeros(batch_size, self.prefix_length, dtype=torch.int64, device=device)
+    def get_dummy_token(self, batch_size, device):
+        return torch.zeros(batch_size, self.img_length, dtype=torch.int64, device=device)
 
-    def forward(self, tokens: torch.Tensor, prefix: torch.Tensor, mask: None,
-                labels: None):
+    def forward(self, tokens, clip_feature, mask=None, labels=None):
         embedding_text = self.gpt.transformer.wte(tokens)
-        prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
-        embedding_cat = torch.cat((prefix_projections, embedding_text), dim=1)
+        clip_projections = self.clip_project(clip_feature).view(-1, self.img_length, self.gpt_embedding_size)
+        embedding_cat = torch.cat((clip_projections, embedding_text), dim=1)
         if labels is not None:
             dummy_token = self.get_dummy_token(tokens.shape[0], tokens.device)
             labels = torch.cat((dummy_token, tokens), dim=1)
         out = self.gpt(inputs_embeds=embedding_cat, labels=labels, attention_mask=mask)
         return out
 
-    def __init__(self, prefix_length: int, clip_length: None, prefix_size: int = 512,
-                 num_layers: int = 8, mapping_type: MappingType = MappingType.MLP):
+    def __init__(self, img_length=10, clip_constant=10, clip_size=512, num_layers=12, mapping_type=MappingType.MLP):
         super(ClipCaptionModel, self).__init__()
-        self.prefix_length = prefix_length
-        self.gpt = GPT2LMHeadModel.from_pretrained('gpt2')
-        self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
+        self.img_length = img_length
+        self.gpt = GPT2LMHeadModel.from_pretrained('./ckpt/gpt2')
+        self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]  # 768 
+        
         if mapping_type == MappingType.MLP:
-            self.clip_project = MLP((prefix_size, (self.gpt_embedding_size * prefix_length) // 2,
-                                     self.gpt_embedding_size * prefix_length))
+            self.clip_project = MLP((clip_size, (self.gpt_embedding_size * img_length) // 2,
+                                     self.gpt_embedding_size * img_length))
         else:
-            self.clip_project = TransformerMapper(prefix_size, self.gpt_embedding_size, prefix_length,
-                                                                     clip_length, num_layers)
+            self.clip_project = TransformerMapper(clip_size, self.gpt_embedding_size, img_length,
+                                                                     clip_constant, num_layers)
 
+
+# train only the image module
+class ClipCaptioner(ClipCaptionModel):
+
+    def parameters(self, recurse=True):
+        return self.clip_project.parameters()
+
+    def train(self, mode=True):
+        super(ClipCaptioner, self).train(mode)
+        self.gpt.eval()
+        return self
